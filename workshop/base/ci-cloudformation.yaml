@@ -1,0 +1,477 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: 'AWS CloudFormation template to create infrastructure for the Data on EKS workshop'
+Parameters:
+  WorkshopC9InstanceType:
+    Description: Workshop Cloud9 instance type
+    Type: String
+    Default: t3.medium
+    AllowedValues:
+      - t2.micro
+      - t3.micro
+      - t3.small
+      - t3.medium
+    ConstraintDescription: Must be a valid Cloud9 instance type
+  WorkshopC9EnvType: 
+    Description: Environment type.
+    Default: 3rdParty
+    Type: String
+    AllowedValues: 
+      - self
+      - 3rdParty
+    ConstraintDescription: must specify self or 3rdParty.
+  WorkshopC9InstanceVolumeSize: 
+    Type: Number
+    Description: The Size in GB of the Cloud9 Instance Volume. 
+    Default: 30
+  Cloud9IDEInstanceType:
+    Description: The type of instance to connect to the environment
+    Type: String
+    Default: t3.medium
+  ParticipantRoleArn:
+    Description: Workshop Studio participant role ARN
+    Type: String
+  AssetsBucketName:
+    Description: Workshop Studio assets bucket name
+    Type: String
+  AssetsBucketPrefix:
+    Description: Workshop Studio assets bucket prefix
+    Type: String
+
+Resources:
+################## PERMISSIONS AND ROLES #################
+  WorkshopC9Role:
+    Type: AWS::IAM::Role
+    Properties:
+      Tags:
+        - Key: Environment
+          Value: AWS Example
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - ec2.amazonaws.com
+            - ssm.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/AdministratorAccess
+      - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Path: "/"
+
+  WorkshopC9OwnerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/AWSCloud9Administrator
+
+  WorkshopC9LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      Policies:
+      - PolicyName:
+          Fn::Join:
+          - ''
+          - - WorkshopC9LambdaPolicy-
+            - Ref: AWS::Region
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            Resource: arn:aws:logs:*:*:*
+          - Effect: Allow
+            Action:
+            - cloudformation:DescribeStacks
+            - cloudformation:DescribeStackEvents
+            - cloudformation:DescribeStackResource
+            - cloudformation:DescribeStackResources
+            - ec2:DescribeInstances
+            - ec2:AssociateIamInstanceProfile
+            - ec2:ModifyInstanceAttribute
+            - ec2:DescribeIamInstanceProfileAssociations
+            - ec2:ReplaceIamInstanceProfileAssociation
+            - iam:ListInstanceProfiles
+            - iam:PassRole
+            - sts:AssumeRole
+            Resource: "*"
+          - Effect: Allow
+            Action:
+            - sts:AssumeRole
+            Resource: !GetAtt WorkshopC9OwnerRole.Arn
+
+################## LAMBDA BOOTSTRAP FUNCTION ################
+
+  WorkshopC9BootstrapInstanceLambda:
+    Description: Bootstrap Cloud9 instance
+    Type: Custom::WorkshopC9BootstrapInstanceLambda
+    DependsOn:
+    - WorkshopC9BootstrapInstanceLambdaFunction
+    - WorkshopC9Instance
+    - WorkshopC9InstanceProfile
+    - WorkshopC9LambdaExecutionRole
+    Properties:
+      Tags:
+        - Key: Environment
+          Value: AWS Example
+      ServiceToken:
+        Fn::GetAtt:
+        - WorkshopC9BootstrapInstanceLambdaFunction
+        - Arn
+      REGION:
+        Ref: AWS::Region
+      StackName:
+        Ref: AWS::StackName
+      EnvironmentId:
+        Ref: WorkshopC9Instance
+      LabIdeInstanceProfileName:
+        Ref: WorkshopC9InstanceProfile
+      LabIdeInstanceProfileArn:
+        Fn::GetAtt:
+        - WorkshopC9InstanceProfile
+        - Arn
+
+  WorkshopC9BootstrapInstanceLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Role:
+        Fn::GetAtt:
+        - WorkshopC9LambdaExecutionRole
+        - Arn
+      Runtime: python3.9
+      MemorySize: 256
+      Timeout: '600'
+      Code:
+        ZipFile: !Sub |
+          from __future__ import print_function
+          import boto3
+          import json
+          import os
+          import time
+          import traceback
+          import cfnresponse
+          
+          def lambda_handler(event, context):
+              # logger.info('event: {}'.format(event))
+              # logger.info('context: {}'.format(context))
+              responseData = {}
+          
+              if event['RequestType'] == 'Create':
+                  try:
+                      # Open AWS clients
+                      ec2 = boto3.client('ec2')
+                      sts_client = boto3.client('sts')
+
+                      environmentId = event['ResourceProperties']['EnvironmentId']
+
+                      assumed_role_object=sts_client.assume_role(
+                          RoleArn="${WorkshopC9OwnerRole.Arn}",
+                          RoleSessionName="MasterKey"
+                      )
+
+                      creds = assumed_role_object['Credentials']
+
+                      cloud9 = boto3.client('cloud9',
+                          aws_access_key_id=creds['AccessKeyId'],
+                          aws_secret_access_key=creds['SecretAccessKey'],
+                          aws_session_token=creds['SessionToken']
+                      )
+
+                      cloud9.create_environment_membership(
+                          environmentId=environmentId,
+                          permissions='read-write',
+                          userArn='arn:aws:sts::${AWS::AccountId}:assumed-role/WSParticipantRole/Participant',
+                      )
+
+                      cloud9.update_environment(
+                          environmentId=environmentId,
+                          managedCredentialsAction='DISABLE'
+                      )
+          
+                      # Get the InstanceId of the Cloud9 IDE
+                      instance = ec2.describe_instances(Filters=[{'Name': 'tag:aws:cloud9:environment','Values': [environmentId]}])['Reservations'][0]['Instances'][0]
+                      # logger.info('instance: {}'.format(instance))
+          
+                      # Create the IamInstanceProfile request object
+                      iam_instance_profile = {
+                          'Arn': event['ResourceProperties']['LabIdeInstanceProfileArn'],
+                          'Name': event['ResourceProperties']['LabIdeInstanceProfileName']
+                      }
+                      # logger.info('iam_instance_profile: {}'.format(iam_instance_profile))
+          
+                      # Wait for Instance to become ready before adding Role
+                      instance_state = instance['State']['Name']
+                      # logger.info('instance_state: {}'.format(instance_state))
+                      while instance_state != 'running':
+                          time.sleep(5)
+                          instance_state = ec2.describe_instances(InstanceIds=[instance['InstanceId']])
+                          # logger.info('instance_state: {}'.format(instance_state))
+
+                      instance_id = instance['InstanceId']
+
+                      response = ec2.describe_iam_instance_profile_associations(
+                          Filters=[
+                              {
+                                  'Name': 'instance-id',
+                                  'Values': [instance_id],
+                              },
+                          ],
+                      )
+
+                      if len(response['IamInstanceProfileAssociations']) > 0:
+                          for association in response['IamInstanceProfileAssociations']:
+                              if association['State'] == 'associated':
+                                  print("{} is active with state {}".format(association['AssociationId'], association['State']))
+                                  ec2.replace_iam_instance_profile_association(AssociationId=association['AssociationId'], IamInstanceProfile=iam_instance_profile)
+                      else:
+                          ec2.associate_iam_instance_profile(IamInstanceProfile=iam_instance_profile, InstanceId=instance_id)
+          
+                      # attach instance profile
+                      #response = ec2.associate_iam_instance_profile(IamInstanceProfile=iam_instance_profile, InstanceId=instance['InstanceId'])
+                      # logger.info('response - associate_iam_instance_profile: {}'.format(response))
+                      r_ec2 = boto3.resource('ec2')
+  
+                      responseData = {'Success': 'Started bootstrapping for instance: '+instance['InstanceId']}
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData, 'CustomResourcePhysicalID')
+                      
+                  except Exception as e:
+                      # logger.error(e, exc_info=True)
+                      responseData = {'Error': str(e)}
+                      cfnresponse.send(event, context, cfnresponse.FAILED, responseData, 'CustomResourcePhysicalID')
+              else:
+                  responseData = {'Success': 'Ignoring request'}
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData, 'CustomResourcePhysicalID')
+
+################## SSM BOOTSRAP HANDLER ###############
+  WorkshopC9OutputBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+
+  WorkshopC9SSMDocument: 
+    Type: AWS::SSM::Document
+    Properties: 
+      Tags:
+        - Key: Environment
+          Value: AWS Example
+      DocumentType: Command
+      Content: 
+        schemaVersion: '2.2'
+        description: Bootstrap Cloud9 Instance
+        mainSteps:
+        - action: aws:runShellScript
+          name: WorkshopC9bootstrap
+          inputs:
+            runCommand:
+            - !Sub |
+              #!/bin/bash
+              date
+              sleep 120
+              echo LANG=en_US.utf-8 >> /etc/environment
+              echo LC_ALL=en_US.UTF-8 >> /etc/environment
+              . /home/ec2-user/.bashrc
+              yum -y remove aws-cli; yum -y install sqlite telnet jq strace tree gcc glibc-static python3 python3-pip gettext bash-completion
+              wget https://releases.hashicorp.com/terraform/1.5.7/terraform_1.5.7_linux_amd64.zip
+              unzip terraform_1.5.7_linux_amd64.zip
+              sudo mv terraform /bin
+              curl -Lo ec2-instance-selector https://github.com/aws/amazon-ec2-instance-selector/releases/download/v2.4.1/ec2-instance-selector-`uname | tr '[:upper:]' '[:lower:]'`-amd64 && chmod +x ec2-instance-selector
+              sudo mv ec2-instance-selector /usr/local/bin/
+              echo '=== INSTALL and CONFIGURE default software components ==='
+              sudo -H -u ec2-user bash -c "pip install --user -U boto boto3 botocore awscli aws-sam-cli"
+              echo "=== Prepare terraform file"
+              git clone https://github.com/jagpk/run-terraform-inside-aws-codebuild.git 
+              cd workshop/eks-spark-airflow
+              echo "terraform { " >> backend.tf
+              echo "   backend \"s3\" { " >> backend.tf
+              echo "   bucket = \"$s3statebucket\"" >> backend.tf
+              echo "   key    = \"$stackname/terraform.tfstate\"" >> backend.tf
+              echo "   region = \"$region\"" >> backend.tf
+              echo "  }" >> backend.tf
+              echo "}" >> backend.tf
+              cat backend.tf
+              terraform init
+              echo '=== Resizing the Instance volume'
+              SIZE=${WorkshopC9InstanceVolumeSize}
+              export ACCOUNTID=${AWS::AccountId}
+              export REGION=${AWS::Region}
+              INSTANCEID=$(curl http://169.254.169.254/latest/meta-data/instance-id)
+              echo "Retrieved instance $INSTANCEID"
+              VOLUMEID=$(aws ec2 describe-instances \
+                --instance-id $INSTANCEID \
+                --query "Reservations[0].Instances[0].BlockDeviceMappings[0].Ebs.VolumeId" \
+                --output text --region $REGION)
+              echo "Retrieved volume $VOLUMEID"
+              aws ec2 modify-volume --volume-id $VOLUMEID --size $SIZE --region $REGION
+              while [ \
+                "$(aws ec2 describe-volumes-modifications \
+                  --volume-id $VOLUMEID \
+                  --filters Name=modification-state,Values="optimizing","completed" \
+                  --query "length(VolumesModifications)"\
+                  --output text --region $REGION)" != "1" ]; do
+              sleep 1
+              done
+              if [ $(readlink -f /dev/xvda) = "/dev/xvda" ]
+              then
+                sudo growpart /dev/xvda 1
+                STR=$(cat /etc/os-release)
+                SUB="VERSION_ID=\"2\""
+                if [[ "$STR" == *"$SUB"* ]]
+                then
+                  sudo xfs_growfs -d /
+                else
+                  sudo resize2fs /dev/xvda1
+                fi
+              else
+                sudo growpart /dev/nvme0n1 1
+                STR=$(cat /etc/os-release)
+                SUB="VERSION_ID=\"2\""
+                if [[ "$STR" == *"$SUB"* ]]
+                then
+                  sudo xfs_growfs -d /
+                else
+                  sudo resize2fs /dev/nvme0n1p1
+                fi
+              fi
+
+              echo '=== Configure .bashrc.d ==='
+              if [[ ! -d "/home/ec2-user/.bashrc.d" ]]; then
+                sudo -H -u ec2-user bash -c "mkdir -p ~/.bashrc.d"
+                sudo -H -u ec2-user bash -c "echo 'for file in ~/.bashrc.d/*.bash; do source \"\$file\"; done' >> ~/.bashrc"
+              fi
+              echo '=== CONFIGURE awscli and setting ENVIRONMENT VARS ==='
+              echo "complete -C '/usr/local/bin/aws_completer' aws" >> /home/ec2-user/.bashrc.d/aws.bash
+              echo '=== CLEANING /home/ec2-user ==='
+              for f in cloud9; do rm -rf /home/ec2-user/$f; done
+              chown -R ec2-user:ec2-user /home/ec2-user/
+              echo '=== PREPARE REBOOT in 1 minute with at ==='
+              FILE=$(mktemp) && echo $FILE && echo '#!/bin/bash' > $FILE && echo 'reboot -f --verbose' >> $FILE && at now + 1 minute -f $FILE
+              echo "Bootstrap completed with return code $?"
+  
+  WorkshopC9BootstrapAssociation: 
+    Type: AWS::SSM::Association
+    DependsOn:
+    - WorkshopC9OutputBucket
+    Properties: 
+      Name: !Ref WorkshopC9SSMDocument
+      OutputLocation: 
+        S3Location:
+          OutputS3BucketName: !Ref WorkshopC9OutputBucket
+          OutputS3KeyPrefix: bootstrapoutput
+      Targets:
+        - Key: tag:SSMBootstrap
+          Values:
+          - Active
+
+################## INSTANCE #####################
+  WorkshopC9InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: "/"
+      Roles:
+      - Ref: WorkshopC9Role
+
+  WorkshopC9Instance:
+    Description: "-"
+    DependsOn: WorkshopC9BootstrapAssociation
+    Type: AWS::Cloud9::EnvironmentEC2
+    Properties:
+      Description: AWS Cloud9 instance for workshop
+      AutomaticStopTimeMinutes: 900
+      InstanceType:
+        Ref: WorkshopC9InstanceType
+      Name: !Sub EKSLabIDE-${AWS::StackName}
+      OwnerArn: !Sub "arn:aws:sts::${AWS::AccountId}:assumed-role/${WorkshopC9OwnerRole}/MasterKey"
+      Tags: 
+        - Key: SSMBootstrap
+          Value: Active
+
+################## Code Build #####################
+  EKSWorkshopRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub eksworkshop-admin-${AWS::StackName}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+                - codebuild.amazonaws.com
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AdministratorAccess
+
+  EKSEnvironmentInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+        - !Ref EKSWorkshopRole
+
+  S3StateBucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: !Join 
+        - '-'
+          - !Ref 'AWS::Region'
+          - !Ref 'AWS::AccountId'
+          - !Ref 'AWS::StackName'
+          - tf-state
+
+  BuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub CodeBuild-${AWS::StackName}
+      ServiceRole: !GetAtt EKSWorkshopRole.Arn
+      Artifacts:
+        Type: NO_ARTIFACTS
+      LogsConfig:
+        CloudWatchLogs:
+          Status:  ENABLED
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: 'aws/codebuild/amazonlinux2-x86_64-standard:4.0'
+        EnvironmentVariables:
+          - Name: CFN_RESPONSE_URL
+            Value: !Ref WaitForStackCreationHandle
+          - Name: s3statebucket
+            Value: !Ref S3StateBucket
+          - Name: stackname
+            Value: !Ref 'AWS::StackName'
+      Source:
+        Location: 'https://github.com/awslabs/data-on-eks.git'
+        BuildSpec: workshop/eks-spark-airflow/buildspec-spark-airflow.yaml
+        GitSubmodulesConfig:
+          FetchSubmodules: 'True'
+        Type: GITHUB
+      TimeoutInMinutes: 10
+      Tags:
+        - Key: Project
+          Value: Run Terraform From CodeBuild
