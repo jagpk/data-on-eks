@@ -27,15 +27,10 @@ Parameters:
     Description: The type of instance to connect to the environment
     Type: String
     Default: t3.medium
-  ParticipantRoleArn:
-    Description: Workshop Studio participant role ARN
+  C9UserRoleArn:
+    Description: Cloud9 user role ARN
     Type: String
-  AssetsBucketName:
-    Description: Workshop Studio assets bucket name
-    Type: String
-  AssetsBucketPrefix:
-    Description: Workshop Studio assets bucket prefix
-    Type: String
+    Default: Admin/jphoolku-Isengard
 
 Resources:
 ################## PERMISSIONS AND ROLES #################
@@ -207,6 +202,12 @@ Resources:
                           userArn='arn:aws:sts::${AWS::AccountId}:assumed-role/WSParticipantRole/Participant',
                       )
 
+                      cloud9.create_environment_membership(
+                          environmentId=environmentId,
+                          permissions='read-write',
+                          userArn='arn:aws:sts::${AWS::AccountId}:assumed-role/${C9UserRoleArn}',
+                      )
+
                       cloud9.update_environment(
                           environmentId=environmentId,
                           managedCredentialsAction='DISABLE'
@@ -293,6 +294,10 @@ Resources:
               echo LANG=en_US.utf-8 >> /etc/environment
               echo LC_ALL=en_US.UTF-8 >> /etc/environment
               . /home/ec2-user/.bashrc
+              export ACCOUNTID=${AWS::AccountId}
+              export REGION=${AWS::Region}
+              export S3StateBucket=${!Ref S3StateBucket}
+              export StackName=${AWS::StackName}
               yum -y remove aws-cli; yum -y install sqlite telnet jq strace tree gcc glibc-static python3 python3-pip gettext bash-completion
               wget https://releases.hashicorp.com/terraform/1.5.7/terraform_1.5.7_linux_amd64.zip
               unzip terraform_1.5.7_linux_amd64.zip
@@ -302,21 +307,20 @@ Resources:
               echo '=== INSTALL and CONFIGURE default software components ==='
               sudo -H -u ec2-user bash -c "pip install --user -U boto boto3 botocore awscli aws-sam-cli"
               echo "=== Prepare terraform file"
-              git clone https://github.com/jagpk/run-terraform-inside-aws-codebuild.git 
-              cd workshop/eks-spark-airflow
+              git clone https://github.com/jagpk/data-on-eks.git /home/ec2-user/environment/data-on-eks
+              cd /home/ec2-user/environment/data-on-eks/workshop/eks-spark-airflow
+              echo " " >> backend.tf
               echo "terraform { " >> backend.tf
               echo "   backend \"s3\" { " >> backend.tf
-              echo "   bucket = \"$s3statebucket\"" >> backend.tf
-              echo "   key    = \"$stackname/terraform.tfstate\"" >> backend.tf
-              echo "   region = \"$region\"" >> backend.tf
+              echo "   bucket = \"$REGION-$ACCOUNTID-$StackName-tf-state\"" >> backend.tf
+              echo "   key    = \"$StackName/terraform.tfstate\"" >> backend.tf
+              echo "   region = \"$REGION\"" >> backend.tf
               echo "  }" >> backend.tf
               echo "}" >> backend.tf
               cat backend.tf
               terraform init
               echo '=== Resizing the Instance volume'
               SIZE=${WorkshopC9InstanceVolumeSize}
-              export ACCOUNTID=${AWS::AccountId}
-              export REGION=${AWS::Region}
               INSTANCEID=$(curl http://169.254.169.254/latest/meta-data/instance-id)
               echo "Retrieved instance $INSTANCEID"
               VOLUMEID=$(aws ec2 describe-instances \
@@ -439,7 +443,7 @@ Resources:
     Properties:
       BucketName: !Join 
         - '-'
-          - !Ref 'AWS::Region'
+        - - !Ref 'AWS::Region'
           - !Ref 'AWS::AccountId'
           - !Ref 'AWS::StackName'
           - tf-state
@@ -459,14 +463,12 @@ Resources:
         ComputeType: BUILD_GENERAL1_SMALL
         Image: 'aws/codebuild/amazonlinux2-x86_64-standard:4.0'
         EnvironmentVariables:
-          - Name: CFN_RESPONSE_URL
-            Value: !Ref WaitForStackCreationHandle
           - Name: s3statebucket
             Value: !Ref S3StateBucket
           - Name: stackname
             Value: !Ref 'AWS::StackName'
       Source:
-        Location: 'https://github.com/awslabs/data-on-eks.git'
+        Location: 'https://github.com/jagpk/data-on-eks.git'
         BuildSpec: workshop/eks-spark-airflow/buildspec-spark-airflow.yaml
         GitSubmodulesConfig:
           FetchSubmodules: 'True'
