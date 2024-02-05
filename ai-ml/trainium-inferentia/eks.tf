@@ -16,6 +16,7 @@ module "eks" {
   subnet_ids = compact([for subnet_id, cidr_block in zipmap(module.vpc.private_subnets, module.vpc.private_subnets_cidr_blocks) :
   substr(cidr_block, 0, 4) == "100." ? subnet_id : null])
 
+
   manage_aws_auth_configmap = true
   aws_auth_roles = [
     # We need to add in the Karpenter node IAM role for nodes launched by Karpenter
@@ -45,7 +46,7 @@ module "eks" {
 
   # security group rule from all ipv4 to nodes for port 22
   node_security_group_additional_rules = {
-    # Critical Secruity group rule for EFA enabled nodes
+    # Critical Security group rule for EFA enabled nodes
     ingress_efa_self_enabled = {
       description = "EFA-enabled self-referencing security group Ingress"
       protocol    = "-1"
@@ -55,7 +56,7 @@ module "eks" {
       self        = true
     }
 
-    # Critical Secruity group rule for EFA enabled nodes
+    # Critical Security group rule for EFA enabled nodes
     egress_efa_self_enabled = {
       description = "EFA-enabled self-referencing security group Egress"
       protocol    = "-1"
@@ -99,7 +100,7 @@ module "eks" {
 
   eks_managed_node_groups = {
     #  It's recommended to have a Managed Node group for hosting critical add-ons
-    #  It's recommeded to use Karpenter to place your workloads instead of using Managed Node groups
+    #  It's recommended to use Karpenter to place your workloads instead of using Managed Node groups
     #  You can leverage nodeSelector and Taints/tolerations to distribute workloads across Managed Node group or Karpenter nodes.
     core_node_group = {
       name        = "core-node-group"
@@ -132,12 +133,11 @@ module "eks" {
     trn1-32xl-ng1 = {
       name        = "trn1-32xl-ng1"
       description = "Tran1 32xlarge node group for hosting ML workloads"
-      # The code filters the private subnets based on their CIDR blocks and selects the subnet ID if the CIDR block starts with "100." Otherwise, it assigns a null value.
-      # The element(compact([...]), 0) expression ensures that only the first non-null value is included in the resulting list of subnet IDs.
-      subnet_ids = [element(compact([for subnet_id, cidr_block in zipmap(module.vpc.private_subnets, module.vpc.private_subnets_cidr_blocks) :
-        substr(cidr_block, 0, 4) == "100." ? subnet_id : null]), 0)
-      ]
-
+      # All trn1 instances should be launched into the same subnet in the preferred trn1 AZ
+      # The preferred AZ is the first AZ listed in the AZ id <-> region mapping in main.tf.
+      # We use index 2 to select the subnet in AZ1 with the 100.x CIDR:
+      #   module.vpc.private_subnets = [AZ1_10.x, AZ2_10.x, AZ1_100.x, AZ2_100.x]
+      subnet_ids = [module.vpc.private_subnets[2]]
       # aws ssm get-parameters --names /aws/service/eks/optimized-ami/1.27/amazon-linux-2-gpu/recommended/image_id --region us-west-2
       # ami_id   = "ami-0e0deb7ae582f6fe9" # Use this to pass custom AMI ID and ignore ami_type
       ami_type       = "AL2_x86_64_GPU" # Contains Neuron driver
@@ -176,9 +176,9 @@ module "eks" {
         echo "Bootstrap complete. Ready to Go!"
       EOT
 
-      min_size     = 0
-      max_size     = 2
-      desired_size = 0
+      min_size     = var.trn1_32xl_min_size
+      max_size     = 4
+      desired_size = var.trn1_32xl_desired_size
 
       # EFA Network Interfaces configuration for Trn1.32xlarge
       network_interfaces = [
@@ -248,7 +248,7 @@ module "eks" {
         }
       ]
 
-      # Commented to investigate further as the node group creation is failing with palcement group
+      # Commented to investigate further as the node group creation is failing with placement group
       # placement = {
       #   spread_domain = "cluster"
       #   groupName     = "trn1-32xl-ng1"
@@ -278,15 +278,14 @@ module "eks" {
     trn1n-32xl-ng = {
       name        = "trn1n-32xl-ng"
       description = "trn1n 32xlarge node group for hosting ML workloads"
-      # The code filters the private subnets based on their CIDR blocks and selects the subnet ID if the CIDR block starts with "100." Otherwise, it assigns a null value.
-      # The element(compact([...]), 0) expression ensures that only the first non-null value is included in the resulting list of subnet IDs.
-      subnet_ids = [element(compact([for subnet_id, cidr_block in zipmap(module.vpc.private_subnets, module.vpc.private_subnets_cidr_blocks) :
-        substr(cidr_block, 0, 4) == "100." ? subnet_id : null]), 0)
-      ]
-
+      # All trn1 instances should be launched into the same subnet in the preferred trn1 AZ
+      # The preferred AZ is the first AZ listed in the AZ id <-> region mapping in main.tf.
+      # We use index 2 to select the subnet in AZ1 with the 100.x CIDR:
+      #   module.vpc.private_subnets = [AZ1_10.x, AZ2_10.x, AZ1_100.x, AZ2_100.x]
+      subnet_ids = [module.vpc.private_subnets[2]]
       # aws ssm get-parameters --names /aws/service/eks/optimized-ami/1.27/amazon-linux-2-gpu/recommended/image_id --region us-west-2
       # ami_id   = "ami-0e0deb7ae582f6fe9" # Use this to pass custom AMI ID and ignore ami_type
-      ami_type       = "AL2_x86_64_GPU"
+      ami_type       = "AL2_x86_64_GPU" # Contains Neuron driver
       instance_types = ["trn1n.32xlarge"]
 
       pre_bootstrap_user_data = <<-EOT
@@ -322,11 +321,11 @@ module "eks" {
         echo "Bootstrap complete. Ready to Go!"
       EOT
 
-      min_size     = 0
-      max_size     = 1
-      desired_size = 0
+      min_size     = var.trn1n_32xl_min_size
+      max_size     = 2
+      desired_size = var.trn1n_32xl_desired_size
 
-      # EFA Network Interfaces configuration for Trn1.32xlarge
+      # EFA Network Interfaces configuration for Trn1.32xlarge
       network_interfaces = [
         {
           description                 = "NetworkInterfaces Configuration For EFA and EKS"
@@ -458,7 +457,7 @@ module "eks" {
         },
       ]
 
-      # Commented to investigate further as the node group creation is failing with palcement group
+      # Commented to investigate further as the node group creation is failing with placement group
       # placement = {
       #   spread_domain = "cluster"
       #   groupName     = "trn1-32xl-ng1"
@@ -484,9 +483,103 @@ module "eks" {
     }
 
     #--------------------------------------------------
-    # Inferentia2 node group for Inf2.1xlarge
+    # Inferentia2 Spot node group
     #--------------------------------------------------
-    # WORK in PROGRESS
+    inf2-24xl-ng = {
+      name        = "inf2-24xl-ng"
+      description = "inf2 24xl node group for ML inference workloads"
+      # The code filters the private subnets based on their CIDR blocks and selects the subnet ID if the CIDR block starts with "100." Otherwise, it assigns a null value.
+      # The element(compact([...]), 0) expression ensures that only the first non-null value is included in the resulting list of subnet IDs.
+      subnet_ids = [element(compact([for subnet_id, cidr_block in zipmap(module.vpc.private_subnets, module.vpc.private_subnets_cidr_blocks) :
+        substr(cidr_block, 0, 4) == "100." ? subnet_id : null]), 0)
+      ]
 
+      # aws ssm get-parameters --names /aws/service/eks/optimized-ami/1.27/amazon-linux-2-gpu/recommended/image_id --region us-west-2
+      # ami_id   = "ami-0e0deb7ae582f6fe9" # Use this to pass custom AMI ID and ignore ami_type
+      ami_type       = "AL2_x86_64_GPU"
+      capacity_type  = "SPOT"
+      instance_types = ["inf2.24xlarge"]
+
+      pre_bootstrap_user_data = <<-EOT
+        # Install Neuron monitoring tools
+        yum install aws-neuronx-tools-2.* -y
+        export PATH=/opt/aws/neuron/bin:$PATH
+      EOT
+
+      min_size     = var.inf2_24xl_min_size
+      max_size     = 2
+      desired_size = var.inf2_24xl_desired_size
+
+      labels = {
+        instance-type = "inf2"
+        provisioner   = "cluster-autoscaler"
+      }
+
+      taints = [
+        {
+          key    = "aws.amazon.com/neuron",
+          value  = true,
+          effect = "NO_SCHEDULE"
+        },
+        {
+          key    = "aws.amazon.com/neuroncore",
+          value  = true,
+          effect = "NO_SCHEDULE"
+        },
+      ]
+
+      tags = merge(local.tags, {
+        Name                     = "inf2-ng1",
+        "karpenter.sh/discovery" = local.name
+      })
+    }
+    inf2-48xl-ng = {
+      name        = "inf2-48xl-ng"
+      description = "inf2 48x large node group for ML inference workloads"
+      # The code filters the private subnets based on their CIDR blocks and selects the subnet ID if the CIDR block starts with "100." Otherwise, it assigns a null value.
+      # The element(compact([...]), 0) expression ensures that only the first non-null value is included in the resulting list of subnet IDs.
+      subnet_ids = [element(compact([for subnet_id, cidr_block in zipmap(module.vpc.private_subnets, module.vpc.private_subnets_cidr_blocks) :
+        substr(cidr_block, 0, 4) == "100." ? subnet_id : null]), 0)
+      ]
+
+      # aws ssm get-parameters --names /aws/service/eks/optimized-ami/1.27/amazon-linux-2-gpu/recommended/image_id --region us-west-2
+      # ami_id   = "ami-0e0deb7ae582f6fe9" # Use this to pass custom AMI ID and ignore ami_type
+      ami_type       = "AL2_x86_64_GPU"
+      capacity_type  = "SPOT"
+      instance_types = ["inf2.48xlarge"]
+
+      pre_bootstrap_user_data = <<-EOT
+        # Install Neuron monitoring tools
+        yum install aws-neuronx-tools-2.* -y
+        export PATH=/opt/aws/neuron/bin:$PATH
+      EOT
+
+      min_size     = var.inf2_48xl_min_size
+      max_size     = 2
+      desired_size = var.inf2_48xl_desired_size
+
+      labels = {
+        instance-type = "inf2-48xl"
+        provisioner   = "cluster-autoscaler"
+      }
+
+      taints = [
+        {
+          key    = "aws.amazon.com/neuron",
+          value  = true,
+          effect = "NO_SCHEDULE"
+        },
+        {
+          key    = "aws.amazon.com/neuroncore",
+          value  = true,
+          effect = "NO_SCHEDULE"
+        },
+      ]
+
+      tags = merge(local.tags, {
+        Name                     = "inf2-48xl-ng",
+        "karpenter.sh/discovery" = local.name
+      })
+    }
   }
 }

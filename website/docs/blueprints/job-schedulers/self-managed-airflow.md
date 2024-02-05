@@ -8,7 +8,6 @@ import TabItem from '@theme/TabItem';
 import CollapsibleContent from '../../../src/components/CollapsibleContent';
 
 import CodeBlock from '@theme/CodeBlock';
-import SparkComputeOptimizedProvisioner from '!!raw-loader!../../../../analytics/terraform/spark-k8s-operator/karpenter-provisioners/spark-compute-optimized-provisioner.yaml';
 
 # Self-managed Apache Airflow deployment on Amazon EKS
 
@@ -47,7 +46,7 @@ We don't recommend removing critical add-ons (`Amazon VPC CNI`, `CoreDNS`, `Kube
 | Amazon VPC CNI | Yes | VPC CNI is available as an [EKS add-on](https://docs.aws.amazon.com/eks/latest/userguide/eks-networking-add-ons.html) and is responsible for creating ENI's and IPv4 or IPv6 addresses for your spark application pods | [VPC CNI Documentation](https://docs.aws.amazon.com/eks/latest/userguide/managing-vpc-cni.html) |
 | CoreDNS | Yes | CoreDNS is available as an [EKS add-on](https://docs.aws.amazon.com/eks/latest/userguide/eks-networking-add-ons.html) and is responsible for resolving DNS queries for spark application and for Kubernetes cluster | [EKS CoreDNS Documentation](https://docs.aws.amazon.com/eks/latest/userguide/managing-coredns.html) |
 | Kube-proxy | Yes | Kube-proxy is available as an [EKS add-on](https://docs.aws.amazon.com/eks/latest/userguide/eks-networking-add-ons.html) and it maintains network rules on your nodes and enables network communication to your spark application pods | [EKS kube-proxy Documentation](https://docs.aws.amazon.com/eks/latest/userguide/managing-kube-proxy.html) |
-| Amazon EBS CSI driver | Yes | EBS CSI driver is available as an [EKS add-on](hhttps://docs.aws.amazon.com/eks/latest/userguide/eks-add-ons.html) and it allows EKS clusters to manage the lifecycle of EBS volumes | [EBS CSI Driver Documentation](https://docs.aws.amazon.com/eks/latest/userguide/ebs-csi.html)
+| Amazon EBS CSI driver | Yes | EBS CSI driver is available as an [EKS add-on](https://docs.aws.amazon.com/eks/latest/userguide/eks-add-ons.html) and it allows EKS clusters to manage the lifecycle of EBS volumes | [EBS CSI Driver Documentation](https://docs.aws.amazon.com/eks/latest/userguide/ebs-csi.html)
 | Amazon EFS CSI driver | Yes | The Amazon EFS Container Storage Interface (CSI) driver provides a CSI interface that allows Kubernetes clusters running on AWS to manage the lifecycle of Amazon EFS file systems. | [EFS CSI Driver Documentation](https://docs.aws.amazon.com/eks/latest/userguide/efs-csi.html)
 | Karpenter | Yes | Karpenter is nodegroup-less autoscaler that provides just-in-time compute capacity for spark applications on Kubernetes clusters | [Karpenter Documentation](https://karpenter.sh/) |
 | Cluster Autoscaler | Yes | Kubernetes Cluster Autoscaler automatically adjusts the size of Kubernetes cluster and is available for scaling nodegroups (such as `core-node-group`) in the cluster | [Cluster Autoscaler Documentation](https://github.com/kubernetes/autoscaler/blob/master/cluster-autoscaler/cloudprovider/aws/README.md) |
@@ -163,7 +162,7 @@ airflow-airflow-ingress   alb     *       k8s-dataengineering-c92bfeb177-randomn
 
 ```
 
-The above ALB URL will be different for you deployment. So use your URL and open it in a brower
+The above ALB URL will be different for you deployment. So use your URL and open it in a browser
 
 e.g., Open URL `http://k8s-dataengineering-c92bfeb177-randomnumber.us-west-2.elb.amazonaws.com/` in a browser
 
@@ -185,22 +184,91 @@ Login with Admin user and password and create new users for Admin and Viewer rol
 
 ![img.png](img/airflow-k8sspark-example.png)
 
-This option presents leverages Karpenter as the autoscaler, eliminating the need for Managed Node Groups and Cluster Autoscaler. In this design, Karpenter and its provisioner are responsible for creating both On-Demand and Spot instances, dynamically selecting instance types based on user demands. Karpenter offers improved performance compared to Cluster Autoscaler, with more efficient node scaling and faster response times. Karpenter's key features include its ability to scale from zero, optimizing resource utilization and reducing costs when there is no demand for resources. Additionally, Karpenter supports multiple provisioners, allowing for greater flexibility in defining the required infrastructure for different workload types, such as compute, memory, and GPU-intensive tasks. Furthermore, Karpenter integrates seamlessly with Kubernetes, providing automatic, real-time adjustments to the cluster size based on observed workloads and scaling events. This enables a more efficient and cost-effective EKS cluster design that adapts to the ever-changing demands of Spark applications and other workloads.
+This option presents leverages Karpenter as the autoscaler, eliminating the need for Managed Node Groups and Cluster Autoscaler. In this design, Karpenter and its Nodepool are responsible for creating both On-Demand and Spot instances, dynamically selecting instance types based on user demands. Karpenter offers improved performance compared to Cluster Autoscaler, with more efficient node scaling and faster response times. Karpenter's key features include its ability to scale from zero, optimizing resource utilization and reducing costs when there is no demand for resources. Additionally, Karpenter supports multiple Nodepools, allowing for greater flexibility in defining the required infrastructure for different workload types, such as compute, memory, and GPU-intensive tasks. Furthermore, Karpenter integrates seamlessly with Kubernetes, providing automatic, real-time adjustments to the cluster size based on observed workloads and scaling events. This enables a more efficient and cost-effective EKS cluster design that adapts to the ever-changing demands of Spark applications and other workloads.
 
-In this tutorial, you will use Karpenter provisioner that uses memory optimized instances. This template uses the AWS Node template with Userdata.
+In this tutorial, you will use Karpenter Nodepool that uses memory optimized instances. This template uses the AWS Node template with Userdata.
 
 <details>
-<summary> To view Karpenter provisioner for memory optimized instances, Click to toggle content!</summary>
+<summary> To view Karpenter Nodepool for memory optimized instances, Click to toggle content!</summary>
 
-<CodeBlock language="yaml">{SparkComputeOptimizedProvisioner}</CodeBlock>
+```yaml
+    name: spark-compute-optimized
+      clusterName: ${module.eks.cluster_name}
+      ec2NodeClass:
+        karpenterRole: ${split("/", module.eks_blueprints_addons.karpenter.node_iam_role_arn)[1]}
+        subnetSelectorTerms:
+          tags:
+            Name: "${module.eks.cluster_name}-private*"
+        securityGroupSelectorTerms:
+          tags:
+            Name: ${module.eks.cluster_name}-node
+        userData: |
+          MIME-Version: 1.0
+          Content-Type: multipart/mixed; boundary="BOUNDARY"
+
+          --BOUNDARY
+          Content-Type: text/x-shellscript; charset="us-ascii"
+
+          cat <<-EOF > /etc/profile.d/bootstrap.sh
+          #!/bin/sh
+
+
+          # Configure the NVMe volumes in RAID0 configuration in the bootstrap.sh call.
+          # https://github.com/awslabs/amazon-eks-ami/blob/master/files/bootstrap.sh#L35
+          # This will create a RAID volume and mount it at /mnt/k8s-disks/0
+          #   then mount that volume to /var/lib/kubelet, /var/lib/containerd, and /var/log/pods
+          #   this allows the container daemons and pods to write to the RAID0 by default without needing PersistentVolumes
+          export LOCAL_DISKS='raid0'
+          EOF
+
+          # Source extra environment variables in bootstrap script
+          sed -i '/^set -o errexit/a\\nsource /etc/profile.d/bootstrap.sh' /etc/eks/bootstrap.sh
+
+          --BOUNDARY--
+
+      nodePool:
+        labels:
+          - type: karpenter
+          - NodeGroupType: SparkComputeOptimized
+          - multiArch: Spark
+        requirements:
+          - key: "karpenter.sh/capacity-type"
+            operator: In
+            values: ["spot", "on-demand"]
+          - key: "kubernetes.io/arch"
+            operator: In
+            values: ["amd64"]
+          - key: "karpenter.k8s.aws/instance-category"
+            operator: In
+            values: ["c"]
+          - key: "karpenter.k8s.aws/instance-family"
+            operator: In
+            values: ["c5d"]
+          - key: "karpenter.k8s.aws/instance-cpu"
+            operator: In
+            values: ["4", "8", "16", "36"]
+          - key: "karpenter.k8s.aws/instance-hypervisor"
+            operator: In
+            values: ["nitro"]
+          - key: "karpenter.k8s.aws/instance-generation"
+            operator: Gt
+            values: ["2"]
+        limits:
+          cpu: 20 # Change this to 1000 or more for production according to your needs
+        disruption:
+          consolidationPolicy: WhenEmpty
+          consolidateAfter: 30s
+          expireAfter: 720h
+        weight: 100
+```
 </details>
 
-To run Spark Jobs that can use this provisioner, you need to submit your jobs by adding `tolerations` to your Spark Application manifest. Additionally, to ensure Spark Driver pods run only on `On-Demand` nodes and Spark Executors run only on `Spot` nodes, add the `karpenter.sh/capacity-type` node selectors.
+To run Spark Jobs that can use this Nodepool, you need to submit your jobs by adding `tolerations` to your Spark Application manifest. Additionally, to ensure Spark Driver pods run only on `On-Demand` nodes and Spark Executors run only on `Spot` nodes, add the `karpenter.sh/capacity-type` node selectors.
 
 For example,
 
 ```yaml
-    # Using Karpenter provisioner nodeSelectors and tolerations
+    # Using Karpenter Nodepool nodeSelectors and tolerations
     nodeSelector:
       NodeGroupType: "SparkComputeOptimized"
       karpenter.sh/capacity-type: "on-demand"
@@ -346,7 +414,7 @@ spec:
     labels:
       version: 3.1.1
     serviceAccount: spark-team-a
-    # Using Karpenter provisioner nodeSelectors and tolerations
+    # Using Karpenter Nodepool nodeSelectors and tolerations
     nodeSelector:
       NodeGroupType: "SparkComputeOptimized"
       karpenter.sh/capacity-type: "on-demand"
@@ -361,7 +429,7 @@ spec:
     serviceAccount: spark-team-a
     labels:
       version: 3.1.1
-    # Using Karpenter provisioner nodeSelectors and tolerations
+    # Using Karpenter Nodepool nodeSelectors and tolerations
     nodeSelector:
       NodeGroupType: "SparkComputeOptimized"
       karpenter.sh/capacity-type: "spot"

@@ -155,7 +155,7 @@ module "eks_blueprints_addons" {
   #---------------------------------------
   enable_aws_fsx_csi_driver = true
   aws_fsx_csi_driver = {
-    # INFO: fsx node daemonset wont be placed on Karpenter nodes with taints without the following toleration
+    # INFO: fsx node daemonset won't be placed on Karpenter nodes with taints without the following toleration
     values = [
       <<-EOT
         node:
@@ -216,7 +216,31 @@ module "eks_blueprints_addons" {
     ],
   }
 
+  #---------------------------------------
+  # AWS Load Balancer Controller Add-on
+  #---------------------------------------
+  enable_aws_load_balancer_controller = true
+  # turn off the mutating webhook for services because we are using
+  # service.beta.kubernetes.io/aws-load-balancer-type: external
+  aws_load_balancer_controller = {
+    set = [{
+      name  = "enableServiceMutatorWebhook"
+      value = "false"
+    }]
+  }
+
+  #---------------------------------------
+  # Ingress Nginx Add-on
+  #---------------------------------------
+  enable_ingress_nginx = true
+  ingress_nginx = {
+    values = [templatefile("${path.module}/helm-values/ingress-nginx-values.yaml", {})]
+  }
+
   tags = local.tags
+
+  # We are installing Karpenter resources with Helm Chart, see helm-values/
+
 }
 
 #---------------------------------------------------------------
@@ -224,7 +248,7 @@ module "eks_blueprints_addons" {
 #---------------------------------------------------------------
 module "eks_data_addons" {
   source  = "aws-ia/eks-data-addons/aws"
-  version = "~> 1.2" # ensure to update this to the latest/desired version
+  version = "~> 1.2.9" # ensure to update this to the latest/desired version
 
   oidc_provider_arn = module.eks.oidc_provider_arn
 
@@ -234,8 +258,108 @@ module "eks_data_addons" {
   # Volcano Scheduler for TorchX
   #---------------------------------------
   enable_volcano = true
-}
 
+  #---------------------------------------
+  # Kuberay Operator
+  #---------------------------------------
+  enable_kuberay_operator = true
+  kuberay_operator_helm_config = {
+    version = "1.0.0-rc.0"
+    # Enabling Volcano as Batch scheduler for KubeRay Operator
+    values = [
+      <<-EOT
+      batchScheduler:
+        enabled: true
+    EOT
+    ]
+  }
+
+  enable_jupyterhub = true
+  jupyterhub_helm_config = {
+    values = [
+      templatefile("${path.module}/helm-values/jupyterhub-values.yaml", {
+        jupyter_single_user_sa_name = kubernetes_service_account_v1.jupyterhub_single_user_sa.metadata[0].name
+      })
+    ]
+  }
+  enable_karpenter_resources = true
+  karpenter_resources_helm_config = {
+    inferentia-inf2 = {
+      values = [
+        <<-EOT
+      name: inferentia-inf2
+      clusterName: ${module.eks.cluster_name}
+      ec2NodeClass:
+        karpenterRole: ${split("/", module.eks_blueprints_addons.karpenter.node_iam_role_arn)[1]}
+        subnetSelectorTerms:
+          id: ${module.vpc.private_subnets[3]}
+        securityGroupSelectorTerms:
+          tags:
+            Name: ${module.eks.cluster_name}-node
+      nodePool:
+        labels:
+          - provisioner: inferentia-inf2
+          - hub.jupyter.org/node-purpose: user
+        taints:
+          - key: aws.amazon.com/neuroncore
+            value: "true"
+            effect: "NoSchedule"
+          - key: aws.amazon.com/neuron
+            value: "true"
+            effect: "NoSchedule"
+          - key: hub.jupyter.org/dedicated # According to optimization docs https://z2jh.jupyter.org/en/latest/administrator/optimization.html
+            operator: "Equal"
+            value: "user"
+            effect: "NoSchedule"
+        requirements:
+          - key: "karpenter.k8s.aws/instance-family"
+            operator: In
+            values: ["inf2"]
+          - key: "karpenter.k8s.aws/instance-size"
+            operator: In
+            values: ["24xlarge", "48xlarge"]
+          - key: "kubernetes.io/arch"
+            operator: In
+            values: ["amd64"]
+          - key: "karpenter.sh/capacity-type"
+            operator: In
+            values: ["spot", "on-demand"]
+      EOT
+      ]
+    }
+    default = {
+      values = [
+        <<-EOT
+      clusterName: ${module.eks.cluster_name}
+      ec2NodeClass:
+        karpenterRole: ${split("/", module.eks_blueprints_addons.karpenter.node_iam_role_arn)[1]}
+        subnetSelectorTerms:
+          id: ${module.vpc.private_subnets[3]}
+        securityGroupSelectorTerms:
+          tags:
+            Name: ${module.eks.cluster_name}-node
+      nodePool:
+        labels:
+          - provisioner: default
+          - workload: rayhead
+        requirements:
+          - key: "karpenter.k8s.aws/instance-family"
+            operator: In
+            values: ["c5", "m5", "r5"]
+          - key: "karpenter.k8s.aws/instance-size"
+            operator: In
+            values: ["xlarge", "2xlarge", "4xlarge", "8xlarge", "16xlarge", "24xlarge"]
+          - key: "kubernetes.io/arch"
+            operator: In
+            values: ["amd64"]
+          - key: "karpenter.sh/capacity-type"
+            operator: In
+            values: ["spot", "on-demand"]
+      EOT
+      ]
+    }
+  }
+}
 
 #---------------------------------------------------------------
 # ETCD for TorchX
@@ -255,25 +379,6 @@ resource "kubectl_manifest" "torchx_etcd" {
 }
 
 #---------------------------------------------------------------
-# Create Volcano Queue once the Volcano add-on is installed
-#---------------------------------------------------------------
-resource "kubectl_manifest" "volcano_queue" {
-  yaml_body = <<YAML
-apiVersion: scheduling.volcano.sh/v1beta1
-kind: Queue
-metadata:
-  name: test
-spec:
-  weight: 1
-  reclaimable: false
-  capability:
-    cpu: 2
-YAML
-
-  depends_on = [module.eks_data_addons]
-}
-
-#---------------------------------------------------------------
 # Grafana Admin credentials resources
 # Login to AWS secrets manager with the same role as Terraform to extract the Grafana admin password with the secret name as "grafana"
 #---------------------------------------------------------------
@@ -290,36 +395,13 @@ resource "random_password" "grafana" {
 
 #tfsec:ignore:aws-ssm-secret-use-customer-key
 resource "aws_secretsmanager_secret" "grafana" {
-  name                    = "${local.name}-grafana"
+  name                    = "${local.name}-oss-grafana"
   recovery_window_in_days = 0 # Set to zero for this example to force delete during Terraform destroy
 }
 
 resource "aws_secretsmanager_secret_version" "grafana" {
   secret_id     = aws_secretsmanager_secret.grafana.id
   secret_string = random_password.grafana.result
-}
-
-locals {
-  karpenter_trn1_32xl_lt_name = format("%s-trn132xl-lt", local.name)
-}
-
-#---------------------------------------
-# Karpenter Provisioners
-#---------------------------------------
-data "kubectl_path_documents" "karpenter_provisioners" {
-  pattern = "${path.module}/karpenter-provisioners/trainium-*.yaml"
-  vars = {
-    azs                  = local.region
-    eks_cluster_id       = local.name
-    launch_template_name = local.karpenter_trn1_32xl_lt_name
-  }
-}
-
-resource "kubectl_manifest" "karpenter_provisioner" {
-  for_each  = toset(data.kubectl_path_documents.karpenter_provisioners.documents)
-  yaml_body = each.value
-
-  depends_on = [module.eks_blueprints_addons]
 }
 
 #tfsec:ignore:*
@@ -335,139 +417,182 @@ module "s3_bucket" {
 }
 
 #---------------------------------------------------------------
-# Create a Launch Template Userdata for Trainium
+# MPI Operator for distributed training on Trainium
 #---------------------------------------------------------------
-data "cloudinit_config" "trn1_lt" {
-  base64_encode = true
-  gzip          = false
-  boundary      = "//"
-
-  # Prepend to existing user data supplied by AWS EKS
-  part {
-    content_type = "text/x-shellscript"
-    content      = <<-EOT
-      cat <<-EOF > /etc/profile.d/bootstrap.sh
-      #!/bin/sh
-
-      # Configure NVMe volumes in RAID0 configuration
-      # https://github.com/awslabs/amazon-eks-ami/blob/056e31f8c7477e893424abce468cb32bbcd1f079/files/bootstrap.sh#L35C121-L35C126
-      # Mount will be: /mnt/k8s-disks
-      export LOCAL_DISKS='raid0'
-
-      # Install Neuron monitoring tools
-      yum install aws-neuronx-tools-2.* -y
-      export PATH=/opt/aws/neuron/bin:$PATH
-
-      # EFA Setup for Trainium and Inferentia
-      export FI_EFA_USE_DEVICE_RDMA=1
-      export FI_PROVIDER=efa
-      export FI_EFA_FORK_SAFE=1
-
-      curl -O https://efa-installer.amazonaws.com/aws-efa-installer-latest.tar.gz
-      tar -xf aws-efa-installer-latest.tar.gz && cd aws-efa-installer
-      ./efa_installer.sh -y -g
-      /opt/amazon/efa/bin/fi_info -p efa
-      EOF
-
-      # Source extra environment variables in bootstrap script
-      sed -i '/^set -o errexit/a\\nsource /etc/profile.d/bootstrap.sh' /etc/eks/bootstrap.sh
-
-      # Bootstrap the node
-      B64_CLUSTER_CA=${module.eks.cluster_certificate_authority_data}
-      API_SERVER_URL=${module.eks.cluster_endpoint}
-      /etc/eks/bootstrap.sh ${local.name} --kubelet-extra-args "--node-labels=eks.amazonaws.com/nodegroup-image=${data.aws_ami.eks_gpu.id}" --b64-cluster-ca $B64_CLUSTER_CA --apiserver-endpoint $API_SERVER_URL
-
-    EOT
-  }
+data "http" "mpi_operator_yaml" {
+  url = "https://raw.githubusercontent.com/kubeflow/mpi-operator/${var.mpi_operator_version}/deploy/v2beta1/mpi-operator.yaml"
 }
+
+data "kubectl_file_documents" "mpi_operator_yaml" {
+  content = data.http.mpi_operator_yaml.response_body
+}
+
+resource "kubectl_manifest" "mpi_operator" {
+  for_each   = var.enable_mpi_operator ? data.kubectl_file_documents.mpi_operator_yaml.manifests : {}
+  yaml_body  = each.value
+  depends_on = [module.eks.eks_cluster_id]
+}
+
+#---------------------------------------------------------------
+# Create a Launch Template Userdata for Trainium, and use it in Karpenter, deprecated
+# This commented section of the pattern is commented due to lack of support in utilizing LaunchTemplates in newer Karpenter versions.
+# See full change list https://github.com/aws/karpenter-provider-aws/blob/d1d1371ae2e1552b8fdded7d343bf24ea18bee31/designs/v1beta1-full-changelist.md#remove-speclaunchtemplate
+#---------------------------------------------------------------
+# data "cloudinit_config" "trn1_lt" {
+#   base64_encode = true
+#   gzip          = false
+#   boundary      = "//"
+
+#   # Prepend to existing user data supplied by AWS EKS
+#   part {
+#     content_type = "text/x-shellscript"
+#     content      = <<-EOT
+#       cat <<-EOF > /etc/profile.d/bootstrap.sh
+#       #!/bin/sh
+
+#       # Configure NVMe volumes in RAID0 configuration
+#       # https://github.com/awslabs/amazon-eks-ami/blob/056e31f8c7477e893424abce468cb32bbcd1f079/files/bootstrap.sh#L35C121-L35C126
+#       # Mount will be: /mnt/k8s-disks
+#       export LOCAL_DISKS='raid0'
+
+#       # Install Neuron monitoring tools
+#       yum install aws-neuronx-tools-2.* -y
+#       export PATH=/opt/aws/neuron/bin:$PATH
+
+#       # EFA Setup for Trainium and Inferentia
+#       export FI_EFA_USE_DEVICE_RDMA=1
+#       export FI_PROVIDER=efa
+#       export FI_EFA_FORK_SAFE=1
+
+#       curl -O https://efa-installer.amazonaws.com/aws-efa-installer-latest.tar.gz
+#       tar -xf aws-efa-installer-latest.tar.gz && cd aws-efa-installer
+#       ./efa_installer.sh -y -g
+#       /opt/amazon/efa/bin/fi_info -p efa
+#       EOF
+
+#       # Source extra environment variables in bootstrap script
+#       sed -i '/^set -o errexit/a\\nsource /etc/profile.d/bootstrap.sh' /etc/eks/bootstrap.sh
+
+#       # Bootstrap the node
+#       B64_CLUSTER_CA=${module.eks.cluster_certificate_authority_data}
+#       API_SERVER_URL=${module.eks.cluster_endpoint}
+#       /etc/eks/bootstrap.sh ${local.name} --kubelet-extra-args "--node-labels=eks.amazonaws.com/nodegroup-image=${data.aws_ami.eks_gpu.id}" --b64-cluster-ca $B64_CLUSTER_CA --apiserver-endpoint $API_SERVER_URL
+
+#     EOT
+#   }
+# }
 
 #---------------------------------------------------------------
 # This Terraform code defines a data block to fetch the most recent Amazon Machine Image (AMI)
 # for an Amazon Elastic Kubernetes Service (EKS) cluster with GPU support.
 #---------------------------------------------------------------
-data "aws_ami" "eks_gpu" {
-  owners      = ["amazon"]
-  most_recent = true
+# data "aws_ami" "eks_gpu" {
+#   owners      = ["amazon"]
+#   most_recent = true
 
-  filter {
-    name   = "name"
-    values = ["amazon-eks-gpu-node-${var.eks_cluster_version}-*"]
-  }
-}
+#   filter {
+#     name   = "name"
+#     values = ["amazon-eks-gpu-node-${var.eks_cluster_version}-*"]
+#   }
+# }
+
+
+# locals {
+#   karpenter_trn1_32xl_lt_name = format("%s-trn132xl-lt", local.name)
+# }
 
 #---------------------------------------------------------------
 # AWS Launch Template Configuration for Karpenter Trn1.32xlarge Instances
 #---------------------------------------------------------------
-resource "aws_launch_template" "trn1_lt" {
-  name        = local.karpenter_trn1_32xl_lt_name
-  description = "Karpenter Trn1.32xlarge Launch Template"
+# resource "aws_launch_template" "trn1_lt" {
+#   name        = local.karpenter_trn1_32xl_lt_name
+#   description = "Karpenter Trn1.32xlarge Launch Template"
 
-  user_data = data.cloudinit_config.trn1_lt.rendered
+#   user_data = data.cloudinit_config.trn1_lt.rendered
 
-  ebs_optimized = true
+#   ebs_optimized = true
 
-  image_id = data.aws_ami.eks_gpu.id
+#   image_id = data.aws_ami.eks_gpu.id
 
-  iam_instance_profile {
-    name = module.eks_blueprints_addons.karpenter.node_instance_profile_name
-  }
+#   iam_instance_profile {
+#     name = module.eks_blueprints_addons.karpenter.node_instance_profile_name
+#   }
 
-  # Commented for visiblity to implement this feature in the future
-  #  placement {
-  #   tenancy = "default"
-  #   availability_zone = "${local.region}d"
-  #   group_name        = local.karpenter_trn1_32xl_lt_name
-  # }
+#   # Commented for visibility to implement this feature in the future
+#   #  placement {
+#   #   tenancy = "default"
+#   #   availability_zone = "${local.region}d"
+#   #   group_name        = local.karpenter_trn1_32xl_lt_name
+#   # }
 
-  metadata_options {
-    http_endpoint               = "enabled"
-    http_tokens                 = "required"
-    http_put_response_hop_limit = 2
-  }
+#   metadata_options {
+#     http_endpoint               = "enabled"
+#     http_tokens                 = "required"
+#     http_put_response_hop_limit = 2
+#   }
 
-  block_device_mappings {
-    device_name = "/dev/xvda"
-    ebs {
-      volume_size           = 100
-      delete_on_termination = true
-      volume_type           = "gp3"
-    }
-  }
+#   block_device_mappings {
+#     device_name = "/dev/xvda"
+#     ebs {
+#       volume_size           = 100
+#       delete_on_termination = true
+#       volume_type           = "gp3"
+#     }
+#   }
 
-  monitoring {
-    enabled = true
-  }
+#   monitoring {
+#     enabled = true
+#   }
 
-  tag_specifications {
-    resource_type = "instance"
+#   tag_specifications {
+#     resource_type = "instance"
 
-    tags = merge(local.tags, {
-      "karpenter.sh/discovery" = local.name
-    })
-  }
+#     tags = merge(local.tags, {
+#       "karpenter.sh/discovery" = local.name
+#     })
+#   }
 
-  # First network interface with device_index=0 and network_card_index=0
-  network_interfaces {
-    device_index                = 0
-    network_card_index          = 0
-    associate_public_ip_address = false
-    interface_type              = "efa"
-    delete_on_termination       = true
-    security_groups             = [module.eks.node_security_group_id]
-    description                 = "Karpenter EFA config for Trainium"
-  }
+#   # First network interface with device_index=0 and network_card_index=0
+#   network_interfaces {
+#     device_index                = 0
+#     network_card_index          = 0
+#     associate_public_ip_address = false
+#     interface_type              = "efa"
+#     delete_on_termination       = true
+#     security_groups             = [module.eks.node_security_group_id]
+#     description                 = "Karpenter EFA config for Trainium"
+#   }
 
-  # Additional network interfaces with device_index=1 and network_card_index ranging from 1 to 7
-  dynamic "network_interfaces" {
-    for_each = range(1, 8) # Create 7 additional network interfaces
-    content {
-      device_index                = 1
-      network_card_index          = network_interfaces.value
-      associate_public_ip_address = false
-      interface_type              = "efa"
-      delete_on_termination       = true
-      security_groups             = [module.eks.node_security_group_id]
-      description                 = "Karpenter EFA config for Trainium"
-    }
-  }
-}
+#   # Additional network interfaces with device_index=1 and network_card_index ranging from 1 to 7
+#   dynamic "network_interfaces" {
+#     for_each = range(1, 8) # Create 7 additional network interfaces
+#     content {
+#       device_index                = 1
+#       network_card_index          = network_interfaces.value
+#       associate_public_ip_address = false
+#       interface_type              = "efa"
+#       delete_on_termination       = true
+#       security_groups             = [module.eks.node_security_group_id]
+#       description                 = "Karpenter EFA config for Trainium"
+#     }
+#   }
+# }
+
+# #---------------------------------------
+# # Karpenter Provisioners
+# #---------------------------------------
+# data "kubectl_path_documents" "karpenter_provisioners" {
+#   pattern = "${path.module}/karpenter-provisioners/karpenter-*.yaml"
+#   vars = {
+#     azs                  = local.region
+#     eks_cluster_id       = local.name
+#     launch_template_name = local.karpenter_trn1_32xl_lt_name
+#   }
+# }
+
+# resource "kubectl_manifest" "karpenter_provisioner" {
+#   for_each  = toset(data.kubectl_path_documents.karpenter_provisioners.documents)
+#   yaml_body = each.value
+
+#   depends_on = [module.eks_blueprints_addons]
+# }
