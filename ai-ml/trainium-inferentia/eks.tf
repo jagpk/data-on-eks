@@ -116,7 +116,7 @@ module "eks" {
       max_size     = 8
       desired_size = 3
 
-      instance_types = ["m5.xlarge"]
+      instance_types = ["m5.2xlarge"]
 
       labels = {
         WorkerType    = "ON_DEMAND"
@@ -529,12 +529,7 @@ module "eks" {
           key    = "aws.amazon.com/neuron",
           value  = "true",
           effect = "NO_SCHEDULE"
-        },
-        {
-          key    = "aws.amazon.com/neuroncore",
-          value  = "true",
-          effect = "NO_SCHEDULE"
-        },
+        }
       ]
 
       tags = merge(local.tags, {
@@ -586,12 +581,7 @@ module "eks" {
           key    = "aws.amazon.com/neuron",
           value  = true,
           effect = "NO_SCHEDULE"
-        },
-        {
-          key    = "aws.amazon.com/neuroncore",
-          value  = true,
-          effect = "NO_SCHEDULE"
-        },
+        }
       ]
 
       tags = merge(local.tags, {

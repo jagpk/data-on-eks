@@ -1,6 +1,7 @@
 .DS_Store
 .idea
 .build
+*.old
 
 # ignore the lock file
 website/package-lock.json
@@ -51,3 +52,7 @@ site
 .tfsec
 
 examples/gradio-ui/*
+ai-ml/trainium-inferentia/examples/gradio-ui/gradio_cached_examples/*
+
+# venv
+**/.venv/*

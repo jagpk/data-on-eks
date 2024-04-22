@@ -268,7 +268,7 @@ module "eks_data_addons" {
   #---------------------------------------
   enable_kuberay_operator = true
   kuberay_operator_helm_config = {
-    version = "1.0.0-rc.0"
+    version = "1.0.0"
     # Enabling Volcano as Batch scheduler for KubeRay Operator
     values = [
       <<-EOT
@@ -321,9 +321,6 @@ module "eks_data_addons" {
           - provisionerType: Karpenter
           - hub.jupyter.org/node-purpose: user
         taints:
-          - key: aws.amazon.com/neuroncore
-            value: "true"
-            effect: "NoSchedule"
           - key: aws.amazon.com/neuron
             value: "true"
             effect: "NoSchedule"
